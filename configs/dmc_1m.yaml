@@ -1,0 +1,23 @@
+# Shared full-size main protocol. Select the method with --preset.
+frames: 1000000
+action_repeat: 2
+envs: 4
+time_limit: 1000
+prefill: 2500
+pretrain: 100
+train_ratio: 512
+batch_size: 16
+batch_length: 64
+burn_in: 0
+hidden: 512
+deter: 512
+stoch: 32
+classes: 32
+cnn_depth: 32
+imag_horizon: 15
+eval_every: 10000
+eval_episodes: 10
+eval_seed: 100000
+precision: fp32
+max_updates: 0
+save_replay: true

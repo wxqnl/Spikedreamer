@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+runs/
+*.pt
+*.npz
+*.mp4
+*.log
+events.out.tfevents.*
+.env
+.DS_Store

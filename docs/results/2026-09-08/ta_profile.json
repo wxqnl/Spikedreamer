@@ -1,0 +1,223 @@
+{
+  "method": "ta",
+  "config": {
+    "method": "ta",
+    "task": "cartpole_balance",
+    "seed": 0,
+    "device": "cuda:0",
+    "frames": 4096,
+    "action_repeat": 2,
+    "envs": 4,
+    "time_limit": 1000,
+    "eval_every": 10000,
+    "eval_episodes": 1,
+    "eval_seed": 100000,
+    "log_every": 512,
+    "prefill": 256,
+    "pretrain": 1,
+    "train_ratio": 512,
+    "batch_size": 16,
+    "batch_length": 64,
+    "burn_in": 0,
+    "replay_capacity": 1000000,
+    "hidden": 512,
+    "deter": 512,
+    "stoch": 32,
+    "classes": 32,
+    "cnn_depth": 32,
+    "io_steps": 1,
+    "core_steps": 8,
+    "input_layers": 1,
+    "output_layers": 1,
+    "persistent": true,
+    "reset_dendrites": true,
+    "readout": "spike",
+    "adaptive_max_steps": 1,
+    "entropy_threshold": 0.8,
+    "spike_reg": 0.0,
+    "threshold": 0.5,
+    "tau": 2.0,
+    "tau_basal": 2.0,
+    "tau_apical": 2.0,
+    "core_norm_gain": 2.0,
+    "dyn_scale": 0.5,
+    "rep_scale": 0.1,
+    "kl_free": 1.0,
+    "unimix": 0.01,
+    "model_lr": 0.0001,
+    "actor_lr": 3e-05,
+    "value_lr": 3e-05,
+    "opt_eps": 1e-08,
+    "grad_clip": 1000.0,
+    "imag_horizon": 15,
+    "discount": 0.997,
+    "lambda_": 0.95,
+    "actor_entropy": 0.0003,
+    "slow_fraction": 0.02,
+    "precision": "fp32",
+    "compile": false,
+    "cpu_threads": 4,
+    "max_updates": 3,
+    "save_replay": true,
+    "resume": false
+  },
+  "checkpoint_frames": 520,
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "torch": "2.6.0+cu124",
+  "batch": 16,
+  "sequence": 64,
+  "horizon": 15,
+  "measurements": {
+    "rssm": {
+      "iterations": 6761,
+      "wall_p50_ms": 1.4543868601322174,
+      "wall_p95_ms": 1.5074163675308228,
+      "wall_mean_ms": 1.463990019365204,
+      "gpu_p50_ms": 1.4172159433364868,
+      "peak_allocated_bytes": 1215069184,
+      "peak_reserved_bytes": 1786773504,
+      "raw_joules": 1987.5430002212524,
+      "raw_joules_per_call": 0.29397174977388735,
+      "source": "nvml_total_energy_counter",
+      "sampling_error": null,
+      "note": "GPU device energy, including idle draw; requires an otherwise idle GPU."
+    },
+    "imagination": {
+      "iterations": 317,
+      "wall_p50_ms": 31.545374542474747,
+      "wall_p95_ms": 32.0910707116127,
+      "wall_mean_ms": 31.59712103404081,
+      "gpu_p50_ms": 31.50339126586914,
+      "peak_allocated_bytes": 2022845440,
+      "peak_reserved_bytes": 2122317824,
+      "raw_joules": 1970.7890000343323,
+      "raw_joules_per_call": 6.217000000108304,
+      "source": "nvml_total_energy_counter",
+      "sampling_error": null,
+      "note": "GPU device energy, including idle draw; requires an otherwise idle GPU."
+    },
+    "policy": {
+      "iterations": 2100,
+      "wall_p50_ms": 4.7379424795508385,
+      "wall_p95_ms": 4.806795436888933,
+      "wall_mean_ms": 4.74543500159468,
+      "gpu_p50_ms": 4.697119951248169,
+      "peak_allocated_bytes": 662042112,
+      "peak_reserved_bytes": 2122317824,
+      "raw_joules": 1248.795000076294,
+      "raw_joules_per_call": 0.5946642857506161,
+      "source": "nvml_total_energy_counter",
+      "sampling_error": null,
+      "note": "GPU device energy, including idle draw; requires an otherwise idle GPU."
+    },
+    "train_update": {
+      "iterations": 21,
+      "wall_p50_ms": 490.5096422880888,
+      "wall_p95_ms": 502.255717292428,
+      "wall_mean_ms": 494.5094128627153,
+      "gpu_p50_ms": 490.4575500488281,
+      "peak_allocated_bytes": 5040495104,
+      "peak_reserved_bytes": 7115636736,
+      "raw_joules": 1723.5419998168945,
+      "raw_joules_per_call": 82.07342856270927,
+      "source": "nvml_total_energy_counter",
+      "sampling_error": null,
+      "note": "GPU device energy, including idle draw; requires an otherwise idle GPU."
+    }
+  },
+  "note": "Short checkpoint performance is not a control result.",
+  "imagination_operation_ledger": {
+    "totals": {
+      "calls": 210.0,
+      "dense_macs": 56395038720.0,
+      "binary_input_dense_macs": 48334110720.0,
+      "linear_binary_synops_proxy": 4223982542.0,
+      "neuron_updates": 39321600.0,
+      "spikes": 3043501.0,
+      "analog_input_dense_macs": 8060928000.0
+    },
+    "layers": {
+      "actor._pre_layers.0": {
+        "calls": 15.0,
+        "dense_macs": 12079595520.0,
+        "binary_input_dense_macs": 12079595520.0,
+        "linear_binary_synops_proxy": 528283136.0
+      },
+      "actor._pre_layers.2.act_fun": {
+        "calls": 15.0,
+        "neuron_updates": 7864320.0,
+        "spikes": 170315.0
+      },
+      "actor._pre_layers.3": {
+        "calls": 15.0,
+        "dense_macs": 4026531840.0,
+        "binary_input_dense_macs": 4026531840.0,
+        "linear_binary_synops_proxy": 87201280.0
+      },
+      "actor._pre_layers.5.act_fun": {
+        "calls": 15.0,
+        "neuron_updates": 7864320.0,
+        "spikes": 155623.0
+      },
+      "actor._dist_layer": {
+        "calls": 15.0,
+        "dense_macs": 15728640.0,
+        "binary_input_dense_macs": 15728640.0,
+        "linear_binary_synops_proxy": 311246.0
+      },
+      "wm.dynamics.input.projections.0": {
+        "calls": 15.0,
+        "dense_macs": 8060928000.0,
+        "analog_input_dense_macs": 8060928000.0
+      },
+      "wm.dynamics.input.fire": {
+        "calls": 15.0,
+        "neuron_updates": 7864320.0,
+        "spikes": 1072359.0
+      },
+      "wm.dynamics.cell.basal_w": {
+        "calls": 15.0,
+        "dense_macs": 8053063680.0,
+        "binary_input_dense_macs": 8053063680.0,
+        "linear_binary_synops_proxy": 825672704.0
+      },
+      "wm.dynamics.cell.apical_w": {
+        "calls": 15.0,
+        "dense_macs": 8053063680.0,
+        "binary_input_dense_macs": 8053063680.0,
+        "linear_binary_synops_proxy": 825672704.0
+      },
+      "wm.dynamics.cell.soma_w": {
+        "calls": 15.0,
+        "dense_macs": 4026531840.0,
+        "binary_input_dense_macs": 4026531840.0,
+        "linear_binary_synops_proxy": 549047808.0
+      },
+      "wm.dynamics.cell.fire": {
+        "calls": 15.0,
+        "neuron_updates": 7864320.0,
+        "spikes": 540811.0
+      },
+      "wm.dynamics.prior_hidden.projections.0": {
+        "calls": 15.0,
+        "dense_macs": 4026531840.0,
+        "binary_input_dense_macs": 4026531840.0,
+        "linear_binary_synops_proxy": 276895232.0
+      },
+      "wm.dynamics.prior_hidden.fire": {
+        "calls": 15.0,
+        "neuron_updates": 7864320.0,
+        "spikes": 1104393.0
+      },
+      "wm.dynamics.prior_logits": {
+        "calls": 15.0,
+        "dense_macs": 8053063680.0,
+        "binary_input_dense_macs": 8053063680.0,
+        "linear_binary_synops_proxy": 1130898432.0
+      }
+    },
+    "scope": "forward Linear/Conv/ConvTranspose MACs and QGate neuron updates; not total FLOPs",
+    "proxy_note": "Binary SynOps assume event-driven execution. Conv counts use mean activity; no sparsity discount is applied to dense GPU MACs."
+  },
+  "effective_steps": 1.0
+}

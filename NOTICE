@@ -1,0 +1,17 @@
+SpikeDreamer
+Copyright 2026 SpikeDreamer contributors.
+Licensed under the Apache License, Version 2.0.
+
+This work derives from Spiking-WM by Yinqian Sun, Feifei Zhao,
+Mingyang Lyu, Yi Zeng, and the Brain-Cog-Lab contributors:
+https://github.com/Brain-Cog-Lab/Spiking-WM
+
+The upstream/ directory contains the original project snapshot retrieved on
+2026-09-08, with its original license, source notices, and acknowledgements.
+spikedreamer/vendor/ contains adapted copies of network, neuron, normalization,
+surrogate-gradient, and utility components. See docs/upstream.md for modifications.
+
+Please cite the original work when using the inherited Spiking-WM architecture:
+Sun et al. (2025), Spiking world model with multicompartment neurons for
+model-based reinforcement learning, PNAS 122(50), e2513319122.
+DOI: 10.1073/pnas.2513319122.

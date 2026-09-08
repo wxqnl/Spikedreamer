@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spikedreamer"
+version = "0.1.0"
+description = "Time-aligned spiking world models for visual continuous control"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4,<2.7", "numpy>=1.24,<2", "einops==0.8.0",
+  "ruamel.yaml==0.17.4", "tensorboard==2.16.2", "pillow>=10",
+  "dm-control==1.0.9", "mujoco==2.3.5", "gym==0.26.2",
+  "imageio", "imageio-ffmpeg", "nvidia-ml-py",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+spikedreamer-train = "spikedreamer.train:main"
+spikedreamer-profile = "spikedreamer.profile:main"
+spikedreamer-eval = "spikedreamer.evaluate:main"
+spikedreamer-aggregate = "spikedreamer.aggregate:main"
+spikedreamer-suite = "spikedreamer.suite:main"
+spikedreamer-diagnose = "spikedreamer.diagnose:main"
+
+[tool.setuptools.packages.find]
+include = ["spikedreamer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
