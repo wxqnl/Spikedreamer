@@ -6,11 +6,11 @@ time_limit: 1000
 prefill: 2500
 pretrain: 100
 train_ratio: 512
-batch_size: 16
+batch_size: 56
 batch_length: 64
-burn_in: 0
+# Burn-in belongs to the preset; original presets remain at zero.
 hidden: 512
-deter: 512
+# Deterministic state width belongs to the preset: ANN=512, LIF=624.
 stoch: 32
 classes: 32
 cnn_depth: 32
@@ -21,3 +21,5 @@ eval_seed: 100000
 precision: fp32
 max_updates: 0
 save_replay: true
+# The fixed-T pair uses the released normalization scale for both methods.
+core_norm_gain: 1.0

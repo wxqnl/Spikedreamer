@@ -8,6 +8,7 @@ from torch import nn
 from .config import upstream_config
 from .rssm import make_rssm, flatten_state, detach_state, stack_states
 from .vendor import networks
+from . import ann
 
 
 @contextmanager
@@ -27,10 +28,10 @@ def lambda_returns(rewards, discounts, next_values, lambda_):
     """Inputs [H, N, 1]; next_values[h] is V(s_{h+1}), including bootstrap."""
     if rewards.shape != discounts.shape or rewards.shape != next_values.shape:
         raise ValueError("Lambda-return inputs must have identical [H,N,1] shapes")
+    inputs = rewards + discounts * next_values * (1 - lambda_)
     result, carry = [], next_values[-1]
     for h in reversed(range(rewards.shape[0])):
-        carry = rewards[h] + discounts[h] * (
-            (1 - lambda_) * next_values[h] + lambda_ * carry)
+        carry = inputs[h] + discounts[h] * lambda_ * carry
         result.append(carry)
     return torch.stack(result[::-1])
 
@@ -51,6 +52,8 @@ def clip_gradients(parameters, maximum):
 
 
 def head(c, feature_size, shape, layers=2, dist="symlog_disc", scale=1.0):
+    if c.method == "ann_gru":
+        return ann.head(c, feature_size, shape, layers, dist, scale)
     u = upstream_config(c)
     return networks.SpikeMLP(
         feature_size, shape, layers, c.hidden, "LIFNode", u.LIFNode,
@@ -64,13 +67,13 @@ class WorldModel(nn.Module):
         self.c = c
         u = upstream_config(c)
         shapes = {"image": (64, 64, 3)}
-        self.encoder = networks.MultiEncoder(
+        self.encoder = ann.encoder(c, shapes) if c.method == "ann_gru" else networks.MultiEncoder(
             shapes, u, mlp_keys="$^", cnn_keys="image", act="LIFNode", norm="PopNorm",
             cnn_depth=c.cnn_depth, kernel_size=4, minres=4, mlp_layers=2,
             mlp_units=c.hidden, symlog_inputs=True)
         self.dynamics = make_rssm(c, actions, self.encoder.outdim)
         features = self.dynamics.feature_size
-        self.decoder = networks.MultiDecoder(
+        self.decoder = ann.decoder(c, features, shapes) if c.method == "ann_gru" else networks.MultiDecoder(
             u, features, shapes, mlp_keys="$^", cnn_keys="image",
             act="LIFNode", norm="PopNorm", cnn_depth=c.cnn_depth,
             kernel_size=4, minres=4, mlp_layers=2, mlp_units=c.hidden,
@@ -86,34 +89,50 @@ class WorldModel(nn.Module):
         return data
 
     def infer(self, data):
-        embed = self.encoder(data)
-        state = None
         b = self.c.burn_in
+        state = None
         if b:
+            if data["image"].shape[1] != b + self.c.batch_length:
+                raise ValueError("Burn-in must precede a complete learning window")
+            # Encode the prefix separately: it must not retain image activations
+            # for backward or shorten the original L64 learning interval.
             with torch.no_grad():
-                warm, _ = self.dynamics.observe(
-                    embed[:, :, :b].detach(), data["action"][:, :b], data["is_first"][:, :b])
-                state = {k: v[:, -1].detach() for k, v in warm.items()}
-        return self.dynamics.observe(embed[:, :, b:], data["action"][:, b:],
+                warm_embed = self.encoder({"image": data["image"][:, :b]})
+                state = self.dynamics.warmup(
+                    warm_embed, data["action"][:, :b], data["is_first"][:, :b],
+                    data["warmup_valid"])
+            del warm_embed
+            embed = self.encoder({"image": data["image"][:, b:]})
+        else:
+            embed = self.encoder(data)
+        return self.dynamics.observe(embed, data["action"][:, b:],
                                      data["is_first"][:, b:], state)
 
     def loss(self, batch):
         data = self.preprocess(batch)
         post, prior = self.infer(data)
-        feat = self.dynamics.get_feat(post)
-        b = self.c.burn_in
-        image_loss = -self.decoder(feat)["image"].log_prob(data["image"][:, b:]).mean()
-        reward_loss = -self.reward(feat).log_prob(data["reward"][:, b:, None]).mean()
-        cont_loss = -self.cont(feat).log_prob(1 - data["is_terminal"][:, b:, None]).mean()
         kl, dyn, rep = self.dynamics.kl_loss(post, prior)
+        b = self.c.burn_in
+        # Keep the released per-head feature branches. Sharing one concatenation
+        # changes FP32 gradient accumulation before the recurrent backward pass.
+        image = self.decoder(self.dynamics.get_feat(post))["image"]
+        reward = self.reward(self.dynamics.get_feat(post))
+        cont = self.cont(self.dynamics.get_feat(post))
+        image_loss = -image.log_prob(data["image"][:, b:]).mean()
+        reward_loss = -reward.log_prob(data["reward"][:, b:, None]).mean()
+        cont_loss = -cont.log_prob(1 - data["is_terminal"][:, b:, None]).mean()
         activity = post["deter"].mean()
-        regularizer = self.c.spike_reg * activity if self.c.method != "gru" else activity * 0
+        regularizer = self.c.spike_reg * activity if self.c.method not in ("gru", "ann_gru") else activity * 0
         total = image_loss + reward_loss + cont_loss + kl + regularizer
         metrics = dict(model_loss=total.detach(), image_loss=image_loss.detach(),
                        reward_loss=reward_loss.detach(), cont_loss=cont_loss.detach(),
                        dynamics_kl=dyn.mean().detach(), representation_kl=rep.mean().detach(),
                        deter_activity=activity.detach(),
                        prior_entropy=self.dynamics.get_dist(prior).entropy().mean().detach())
+        if self.c.method == "stateful_slowmem":
+            metrics.update(self.dynamics.retention_metrics())
+        elif self.c.method == "stateful_gatedmem":
+            metrics.update(self.dynamics.retention_metrics(post))
         if "steps" in prior:
             metrics["effective_steps"] = prior["steps"].mean().detach()
         else:
@@ -128,22 +147,29 @@ class Agent(nn.Module):
         self.wm = WorldModel(c, actions)
         u = upstream_config(c)
         features = self.wm.dynamics.feature_size
-        self.actor = networks.ActionHead(
+        self.actor = ann.actor(c, features, actions) if c.method == "ann_gru" else networks.ActionHead(
             features, actions, 2, c.hidden, "LIFNode", u.LIFNode, "PopNorm",
             u.PopNorm, dist="normal", min_std=0.1, max_std=1.0,
             spike_times=c.io_steps)
         self.value = head(c, features, (255,), scale=0.0)
+        # Upstream RequiresGrad enables neuron thresholds during every training
+        # phase. Enable them before Adam captures its parameter groups as well.
+        for module in (self.wm, self.actor, self.value):
+            module.requires_grad_(True)
         self.slow_value = deepcopy(self.value).requires_grad_(False)
         self.register_buffer("return_quantiles", torch.zeros(2))
         self.to(c.device)
         # Optimizers own each network exactly once. Slow value is a frozen EMA.
-        def optimizer(module, lr):
+        def optimizer(module, lr, eps, clip):
             return torch.optim.Adam(
-                [p for p in module.parameters() if p.requires_grad], lr=lr, eps=c.opt_eps)
-        self.model_opt = optimizer(self.wm, c.model_lr)
-        self.actor_opt = optimizer(self.actor, c.actor_lr)
-        self.value_opt = optimizer(self.value, c.value_lr)
+                [dict(params=list(module.parameters()), grad_clip=clip)], lr=lr, eps=eps)
+        self.model_opt = optimizer(self.wm, c.model_lr, c.opt_eps, c.grad_clip)
+        self.actor_opt = optimizer(self.actor, c.actor_lr, c.ac_opt_eps, c.actor_grad_clip)
+        self.value_opt = optimizer(self.value, c.value_lr, c.ac_opt_eps, c.value_grad_clip)
         self.updates = 0
+        if getattr(c, "compile", False):
+            from .acceleration import accelerate
+            accelerate(self)
 
     def autocast(self):
         return (torch.autocast("cuda", dtype=torch.bfloat16)
@@ -154,7 +180,7 @@ class Agent(nn.Module):
             raise FloatingPointError("Non-finite training loss")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        norm = clip_gradients(parameters, self.c.grad_clip)
+        norm = clip_gradients(parameters, optimizer.param_groups[0]["grad_clip"])
         optimizer.step()
         return norm.detach()
 
@@ -175,30 +201,43 @@ class Agent(nn.Module):
                 torch.stack(actions), torch.stack(entropies))
 
     def behavior_loss(self, post, terminal):
+        # Match upstream's EMA timing: update the target before behavior learning.
+        with torch.no_grad():
+            mix = self.c.slow_fraction
+            for target, source in zip(self.slow_value.parameters(), self.value.parameters()):
+                target.copy_(mix * source + (1 - mix) * target)
         start = flatten_state(post)
         with frozen(self.wm), frozen(self.value):
-            feats, states, actions, entropy = self.imagine(start)
-            next_feat = feats[:, 1:]
-            rewards = self.wm.reward(next_feat).mode()
-            discounts = self.c.discount * self.wm.cont(next_feat).mean
+            feats, states, actions, _ = self.imagine(start)
+            # The released H-step rollout uses s_0..s_{H-1}, hence H-1 targets.
+            # Its discount weights use the learned continuation at s_0 as well;
+            # do not introduce a separate replay-terminal mask for this baseline.
+            feats = feats[:, :-1]
+            rewards = self.wm.reward(feats).mode()
+            discounts = self.c.discount * self.wm.cont(feats).mean
             values = self.value(feats).mode()
-            returns = lambda_returns(rewards, discounts, values[1:], self.c.lambda_)
+            returns = lambda_returns(
+                rewards[1:], discounts[1:], values[1:], self.c.lambda_)
             with torch.no_grad():
                 q = torch.quantile(returns.detach().float(), returns.new_tensor([0.05, 0.95]).float())
-                self.return_quantiles.lerp_(q, 0.01)
-                scale = (self.return_quantiles[1] - self.return_quantiles[0]).clamp_min(1)
-                valid = (1 - terminal.flatten()).reshape(1, -1, 1)
-                weights = valid * torch.cumprod(
-                    torch.cat([torch.ones_like(discounts[:1]), discounts[:-1]], 0), 0)
-            advantage = (returns - values[:-1].detach()) / scale
+                self.return_quantiles.copy_(0.01 * q + 0.99 * self.return_quantiles)
+                offset = self.return_quantiles[0]
+                scale = (self.return_quantiles[1] - offset).clamp_min(1)
+                weights = torch.cumprod(
+                    torch.cat([torch.ones_like(discounts[:1]), discounts[:-1]], 0), 0)[:-1]
+            # Upstream's dynamics objective differentiates through the value
+            # baseline's inputs, while the value parameters themselves are frozen.
+            advantage = (returns - offset) / scale - (values[:-1] - offset) / scale
+            entropy = self.actor(feats.detach()).entropy()
             actor_loss = -(weights * (
-                advantage + self.c.actor_entropy * entropy[..., None])).mean()
+                advantage + self.c.actor_entropy * entropy[:-1, ..., None])).mean()
         detached = feats[:, :-1].detach()
         value_dist = self.value(detached)
         with torch.no_grad():
             slow = self.slow_value(detached).mode()
-        value_loss = -(weights.squeeze(-1) * (
-            value_dist.log_prob(returns.detach()) + value_dist.log_prob(slow))).mean()
+        value_loss = -value_dist.log_prob(returns.detach())
+        value_loss = value_loss - value_dist.log_prob(slow)
+        value_loss = (weights * value_loss[..., None]).mean()
         metrics = dict(actor_loss=actor_loss.detach(), value_loss=value_loss.detach(),
                        actor_entropy=entropy.mean().detach(), imagined_return=returns.mean().detach(),
                        imagined_reward=rewards.mean().detach())
@@ -218,11 +257,10 @@ class Agent(nn.Module):
             actor_loss, self.actor_opt, self.actor.parameters())
         metrics["value_grad_norm"] = self.update_parameters(
             value_loss, self.value_opt, self.value.parameters())
-        with torch.no_grad():
-            for target, source in zip(self.slow_value.parameters(), self.value.parameters()):
-                target.lerp_(source, self.c.slow_fraction)
         self.updates += 1
-        return {k: float(v.detach().float()) for k, v in metrics.items()}
+        # Transfer the scalar packet once, rather than synchronizing for every key.
+        values = torch.stack([v.detach().float() for v in metrics.values()]).cpu().tolist()
+        return dict(zip(metrics, values))
 
     @torch.no_grad()
     def act(self, obs, state=None, previous_action=None, evaluation=False):
@@ -235,7 +273,8 @@ class Agent(nn.Module):
         with self.autocast():
             embed = self.wm.encoder({"image": image})
             post, _ = self.wm.dynamics.obs_step(
-                state, previous_action, embed, first, sample=not evaluation)
+                state, previous_action, embed, first, sample=True,
+                reset=bool(obs["is_first"].any()))
             distribution = self.actor(self.wm.dynamics.get_feat(post))
             action = distribution.mode() if evaluation else distribution.sample()
         return action.float().clamp(-1, 1), detach_state(post)

@@ -14,14 +14,26 @@ from .runtime import rng_state, restore_rng, seed_everything
 
 
 def evaluate(agent, c, episodes=None, video=None):
+    import os
     saved = rng_state()
     mode = agent.training
     scores, lengths = [], []
     frames = []
     agent.eval()
     try:
+        count = episodes or c.eval_episodes
+        if os.environ.get("SPIKEDREAMER_ENV_PROCESS") == "1" and c.envs > 1 and count > 1:
+            from .parallel_evaluate import evaluate_parallel
+            scores, lengths = evaluate_parallel(agent, c, count, frames, video)
+            if video:
+                imageio.mimsave(video, frames, fps=30)
+            return dict(eval_return=float(np.mean(scores)),
+                        eval_std=float(np.std(scores)), eval_scores=scores,
+                        eval_length=float(np.mean(lengths)), eval_episodes=len(scores))
         for index in range(episodes or c.eval_episodes):
-            # Common held-out initial conditions for every method and checkpoint.
+            # Both environment initialization and posterior sampling use fixed
+            # held-out seeds; the training RNG is restored in the finally block.
+            seed_everything(c.eval_seed + index, c.cpu_threads)
             env = DMC(c, c.eval_seed + index)
             try:
                 obs, state, previous = env.reset(), None, None
@@ -50,6 +62,8 @@ def evaluate(agent, c, episodes=None, video=None):
 
 def load_agent(checkpoint, device=None):
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if saved.get("format_version") != 2:
+        raise ValueError("Use the archived code to evaluate pre-correction checkpoints")
     c = SimpleNamespace(**saved["config"])
     if device:
         c.device = device

@@ -438,15 +438,15 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
 
     def mode(self):
         _mode = F.one_hot(
-            torch.argmax(super().logits, axis=-1), super().logits.shape[-1]
+            torch.argmax(self.logits, axis=-1), self.logits.shape[-1]
         )
-        return _mode.detach() + super().logits - super().logits.detach()
+        return _mode.detach() + self.logits - self.logits.detach()
 
     def sample(self, sample_shape=(), seed=None):
         if seed is not None:
             raise ValueError("need to check")
         sample = super().sample(sample_shape)
-        probs = super().probs
+        probs = self.probs
         while len(probs.shape) < len(sample.shape):
             probs = probs[None]
         sample += probs - probs.detach()

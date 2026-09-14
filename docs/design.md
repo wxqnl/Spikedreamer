@@ -1,70 +1,130 @@
-# SpikeDreamer v0.1：设计与实现
+# 设计与方法：输入依赖的树突记忆
 
-## 动机与主假设
+本文对应 2026-09-14 整理后的主方法 `stateful_gatedmem32`。实现来自已完成 1M 帧训练的冻结 Gated Memory 快照。本文解释现有代码，不引入新算法。
 
-Spiking-WM 已经给出端到端脉冲世界模型。它的发布版 RSSM 每次 `obs_step/img_step` 重置模块内部神经元状态，并在该环境转移内展开 T 次；官方启动脚本取 T=8。上一转移的 deterministic spike 表示仍有递归连接，不能将它描述为“完全没有跨时间记忆”。
+## 1. 研究问题和实现范围
 
-本项目改变的是神经元状态的时间组织：把 MCN 胞体、树突和相关 LIF 膜电位显式放入 RSSM state，沿真实转移及想象转移携带。主模型每次转移只更新一次。主假设是这能减少重复仿真，在相同环境预算下保持控制性能；这仍需完整实验。
+问题是如何在脉冲世界模型中管理跨环境转移的神经元状态。我们把树突状态的保留与胞体发放复位分开，并让保留比例依赖输入。训练端从真实历史恢复片段初始状态；想象端沿分支携带相同结构的状态。
 
-## 状态与计算
+该设计建立在 Spiking-WM 之上。[原论文](https://doi.org/10.1073/pnas.2513319122) 已提出 MCN 和脉冲世界模型；[发布代码](../upstream/networks.py) 保留跨环境转移的 spike-indexed recurrence。本项目所说的“显式状态”是膜状态进入轨迹，而不是给原本无递归的网络添加时间联系。
 
-每条轨迹持有：
+完整 ANN-GRU 是共享训练器下的另一条模型路径，不是本方法内部隐藏的 ANN 记忆支路。
 
-| 字段 | 形状，不含序列轴 | 含义 |
+## 2. 两个时间轴
+
+令 h 表示环境决策步，k=1,...,T 表示一次转移内的脉冲仿真索引，当前 T=8。action repeat=2，因此一个完整决策步通常对应两个原始环境帧。
+
+`StatefulFixedRSSM.img_step` 保留发布版的配对方式：第 (h,k) 个内部步使用上一环境步 **同一个 k** 的脉冲 s[h-1,k]，不是 s[h,k-1]。胞体与树突电位则在内部 k 轴连续积分，并在 k=T 后传到下一环境步。输入 LIF 在 T 个内部步重复消费当前 latent/action 输入，外围 SNN 仍使用 T8。
+
+这种双时间轴不能与单步时间对齐 TAP 混为一谈。早期 `ta` 和 `adaptive` 分支仍保留以兼容旧记录，但不是当前主方法。
+
+## 3. 轨迹状态
+
+下表省略学习序列轴；B 为轨迹数，D=512，Z=C=32。
+
+| 字段 | 形状 | 含义与边界 |
 |---|---|---|
-| `stoch`, `logit` | B×32×32 | categorical 群体编码及其模拟值 logits |
-| `deter` | B×512 | 当前 MCN spike，主配置严格为 0/1 |
-| `soma`, `basal`, `apical` | B×512 | 发放及 reset 后的胞体、树突状态 |
-| `input_mem`, `prior_mem` | B×层数×512 | 跨转移的输入与 prior LIF 膜电位 |
-| `steps` | B×1 | 此次转移实际使用的核心更新次数 |
+| `stoch`, `logit` | B×32×32 | 分类潜变量及其 logits |
+| `deter` | B×8×512 | 上一次转移各内部索引的发放输出 |
+| `soma`, `basal`, `apical` | B×512 | T8 末端的胞体和两路树突电位 |
+| `input_mem` | B×input_layers×512 | 输入 LIF 边界膜状态 |
+| `prior_mem` | B×output_layers×512 | 先验 LIF 边界膜状态 |
+| `steps` | B×1 | 实际内部步数，当前固定为 8 |
+| `gate_stats` | B×6 | 两路保留乘积的均值/最小值/最大值，仅 detach 日志 |
 
-每个 categorical 分组选择一个类别，通过 straight-through 重参数化训练。32 组共有 32 个激活位；主配置不沿内部 T 轴复制。像素、连续动作、概率分布读出及神经元内部电位仍为模拟值，不宣称全链路只有二值运算。
+`deter` 在实际转移后为二值脉冲；继承的学得初始状态由 `tanh(raw.W)` 构造，不能把它也描述成已发放脉冲。树突、胞体、权重、门值、动作和分布读出均包含连续值。本实现使用稠密 GPU 运算，不声称全链路只有二值算术或自动获得事件驱动节能。
 
-MCN 保留发布源码的积分形式。令 `b_in, a_in, u_in` 为投影与 PopNorm 后的电流：
+真实 episode 起点逐样本重置完整状态并屏蔽入站动作。观测 posterior 的 LIF 每次观测重置，不进入 imagination 所需的持久状态；编码器、解码器、Actor 和 Value 的局部膜状态也不跨环境转移共享。
+
+## 4. 输入依赖的树突更新
+
+### 4.1 门控
+
+对输入脉冲 x[h,k] 和上一步同索引脉冲 s[h-1,k]：
 
 ```text
-b = b_prev + (b_in - b_prev) / tau_b
-a = a_prev + (a_in - a_prev) / tau_a
-u = u_prev + sigmoid(a) * (b - 2*u_prev + u_in) / tau
-s = QGate(u - threshold)
+c[h,k] = concat(x[h,k], s[h-1,k])
+g[h,k] = W_gate c[h,k] + b_gate
+(logit_b, logit_a) = split(g[h,k])
+rho_j[h,k] = exp(logsigmoid(logit_j[h,k]) / T)
+write_j[h,k] = 1 - rho_j[h,k]
+             = -expm1(logsigmoid(logit_j[h,k]) / T)
 ```
 
-默认发放后重置胞体和两条树突，reset 的 spike 分支 detach，膜电位跨时间不 detach。`reset_dendrites=False` 可单独消融树突重置。此处以发布代码为基准，不将其声称为论文公式的逐字转写。
+j∈{b,a} 分别对应基树突和顶树突。`W_gate` 是一个合并的 1024×1024 投影，偏置为 1024 维，总计 1,049,600 个参数。使用 `logsigmoid` 和 `expm1` 避免接近 1 的保留率产生明显的相消误差。
 
-新核心 PopNorm 初始 gain 为 `threshold × core_norm_gain`，默认 `core_norm_gain=2`。单步串联神经元在原尺度下初始活动过低，因而显式开放该尺度；它是一个需要报告的设计变化，须与 `gain=1` 及 reset 对照共同检验，不能把全部收益归因于持久状态。
+门的输入在树突积分前即可获得，因此一次批量计算 T8 门值，再执行原顺序的 T8 神经元积分。这个优化不删除内部步、不降低精度，也不截断梯度。
 
-编码器、posterior 观测融合、decoder、actor 和 critic 是每次调用独立的 SNN 计算；它们的内部膜电位不跨环境转移延续。持久化范围仅限上表。主配置这些读出模块也使用 T=1。
+### 4.2 树突和胞体
 
-## 状态边界与训练目标
+候选电流仍来自原 MCN 的投影与 PopNorm，沿用上游参数名称（包括 `apcial_w` 的历史拼写），保持检查点兼容：
 
-- 状态字典不在调用者侧原地修改；各 imagination 分支携带独立状态，训练与评估不依赖共享 MCN 缓存。
-- `is_first` 逐样本重置所有动态状态并屏蔽入站动作。episode 时间截断不误标为环境终止。
-- Replay 中 `action[t]` 表示到达 `observation[t]` 的动作；随机片段起点与跨 episode 拼接均设置 reset。可用 `burn_in` 在不回传梯度的前缀上恢复状态；基准默认 0。
-- World-model loss = 图像 NLL + 两热奖励 NLL + continuation NLL + balanced KL。主配置无额外稀疏正则；`spike_reg` 仅约束最后一次核心发放的平均活动，不等于全部计算成本。
-- 想象 H=15 个动作、H+1 个状态，用 `r(s[t+1])`、`V(s[t+1])` 和正确的末端 bootstrap 计算 λ-return。actor 通过冻结参数但保留输入梯度的世界模型训练；critic 使用 detach 目标和慢网络正则。
-- FP32 是主协议；BF16 保留 FP32 概率读出。大而有限的梯度使用 FP64 范数后进行标准全局裁剪，真正 NaN/Inf 仍报错，绝不清零伪装成功。v0.1 使用 eager，不包含未经验证的编译或稀疏 GPU 加速声明。
+```text
+candidate_b = basal_norm(basal_w(c))
+candidate_a = apical_norm(apcial_w(c))
+input_u     = soma_norm(soma_w(x))
 
-## 方法与必要对照
+b = b_prev + write_b * (candidate_b - b_prev)
+a = a_prev + write_a * (candidate_a - a_prev)
 
-| 设置 | 动态核心 | 外围 SNN T | 回答的问题 |
-|---|---|---:|---|
-| `legacy` | 发布版、内部 T=8、每转移重置 | 8 | 统一训练器下的原架构主基线 |
-| `legacy` + `core_steps=1 io_steps=1` | 发布版 T=1 | 1 | 仅缩短原模型是否已足够 |
-| `ta` | 持久 MCN，单步 | 1 | 主方法 |
-| `ta_core` | 持久 MCN，单步 | 8 | 隔离动态核心收益 |
-| `ta` + `persistent=False` | 重置膜电位，保留 spike 递归 | 1 | 神经元跨转移记忆是否有效 |
-| `binary` | 无膜电位 MCN 硬阈值递归，LIF 不跨转移 | 1 | 膜电位动力学是否优于二值递归 |
-| `gru` | 同宽 GRU 动态核心，仍使用脉冲外围 | 1 | GRU 动态控制，不是完整 ANN Dreamer |
-| `ta` + `readout=membrane` | 下游改读胞体电位 | 1 | spike-only 读出的代价 |
+u = u_prev + sigmoid(a) * (b - 2*u_prev + input_u) / tau
+s = QGate(u - threshold)
+u = u * (1 - stop_gradient(s))
+```
 
-MCN binary 对照保持同形状的三个投影，但不执行树突/胞体时间积分。GRU 仅保持宽度一致，不声称参数完全相同；每个 run 的 manifest 记录真实参数量。
+当前 b、a 不随 s 清空；u 仍执行原硬复位。注意这里有两种不同的“门”：原 `sigmoid(a)` 调节树突对胞体的作用，新 `memory_gates` 调节树突自身的记忆保留。后者是本版本的新增模块，不能将前者写成本项目的新贡献。
 
-## 自适应分支：已实现，未作为主方法
+对给定候选，树突更新是逐维凸组合。但候选本身来自递归网络，这不构成整个系统有界、梯度稳定或长程记忆有效的证明。
 
-`adaptive` 在第一步后计算 categorical prior 的分组归一化熵。超过 `entropy_threshold` 的样本被实际 gather 到紧凑 batch，执行额外 MCN/prior 更新，再 scatter 回完整状态。外部 action/latent 只消费一次，额外步输入为零外部 spikes，最多 `adaptive_max_steps=4`。输入 LIF 不在额外步重复编码。
+### 4.3 初始化与统计口径
 
-门控是硬规则，没有对整数 K 虚构可微梯度，也没有实现设计初稿中不可直接求导的 K-budget loss。需要在开发集校准阈值，报告观测及想象阶段的实际 K，并计入 gather/scatter 和 host 同步开销。
+设初始半衰期 H0=8 个环境决策步：
 
-当前默认阈值 0.8 在短运行中几乎总执行 K=4，且长 BPTT 梯度很大。虽然数值裁剪和完整更新已跑通，尚不能视为稳定有效的自适应算法。优先检验固定单步模型，不为这条分支增加未经验证的机制。
+```text
+r0 = 2 ** (-1 / H0)
+W_gate = 0
+b_gate = logit(r0)
+rho0 = r0 ** (1 / T)
+```
 
-本文件取代前期讨论稿中的实现假设；具体代码、计数边界与统计口径以本仓库 v0.1 为准。
+恒定初值下，一次决策的 T 步直接保留乘积为 r0，H0 次决策后为 1/2。构建门层时保留并恢复 CPU RNG，避免新增层构造消耗随机数而改变外围网络初始化。初始化时它退化为前版 Static Slow Memory 的保留设置；训练后门权重才学到输入选择性。
+
+日志 `keep_env` 记录实际 T 个内部步的 rho 乘积。训练后各步门值可不同，这个乘积不是单一固定半衰期，更不是整网的记忆长度。候选对历史的依赖、胞体动力学、随机潜变量和后续网络都不包含在这一标量解释中。
+
+## 5. 真实历史预热与学习
+
+`Replay.sample(B, L, burn_in=32)` 保留原 L=64 学习窗口的采样，额外构造同一 episode 中最多 32 步先前记录。构造前缀不再消耗回放 RNG。前缀不足时只为固定张量形状重复一条真实观测，并通过 `warmup_valid` 禁止这些填充位置更新状态。
+
+预热执行真实 encoder 和 RSSM，但包在 `torch.no_grad()` 中；结束状态 detach 后才进入完整 L64 学习。学习窗口中的真实 episode 边界仍会重置状态；后续拼接片段也有明确边界。没有从未来观测推断前缀，也没有把 32 步前缀加进 loss 或更新预算。
+
+这能减轻随机片段零状态初始化与在线状态的不一致，但预热最多覆盖 32 步，不保证重建任意长历史下的精确在线状态。早于可用前缀的历史仍被截断；本次实验尚未单独测量这类状态误差。
+
+## 6. 世界模型与策略学习
+
+[model.py](../spikedreamer/model.py) 联合优化图像 NLL、离散回报 NLL、continuation NLL 和 balanced KL。当前 `spike_reg=0`，没有额外稀疏目标。
+
+Actor 和 Value 在后验状态起点上做 H=15 的潜空间想象。行为目标沿用修正后共享训练器和发布实现的状态/奖励对齐、continuation 权重、回报归一化与慢 Value 正则；当前门控版本不额外改写这些目标。Actor 学习时冻结世界模型参数，但保留经世界模型输入的梯度；三个 Adam 分别拥有世界模型、Actor、Value 参数。
+
+使用原二值发放与分类潜变量构造 `get_feat`。`basal`、`apical` 和 `gate_stats` 不直接拼接到预测头或策略输入，因而没有新增连续记忆特征旁路。
+
+## 7. 对照与可归因范围
+
+| 比较 | 保持一致的部分 | 同时变化/限制 |
+|---|---|---|
+| Stateful-T8 vs Legacy-T8 | 同尺寸、固定 T8、共享训练协议 | 跨转移膜状态组织；早期运行有吞吐改进和恢复分段 |
+| Gated Memory vs Stateful-T8 | SNN 外围、T8、胞体与读出骨架 | burn-in32、树突不清空、输入门控及更多参数 |
+| Gated Memory vs Static Slow Memory | 初始保留、外围初始化基准、burn-in、T8 | 输入依赖门替代静态保留参数；Static 只完成 90K 检查点 |
+| Gated Memory vs ANN-GRU | 1M 帧、B56/L64/H15、更新预算 | 全套网络类型、T、参数、burn-in 和计算量 |
+| LIF-T8 vs MCN 方法 | SNN 外围、T8、共享任务协议 | 单房室结构与 deter=624；不是逐参数匹配 |
+
+论文需要检验的贡献是这些机制的效果及适用条件。当前单 seed 结果不能回答“收益是否主要来自更多参数”“是否仅为 burn-in 效果”或“在新任务上是否依旧成立”。
+
+## 8. 代码入口
+
+- [rssm.py](../spikedreamer/rssm.py)：`RSSMBase.warmup`、`StatefulFixedRSSM`、`StatefulGatedMemoryRSSM`、完整 ANN 和 LIF 核心。
+- [replay.py](../spikedreamer/replay.py)：有效前缀、不可变采样与检查点引用。
+- [model.py](../spikedreamer/model.py)：`WorldModel.infer/loss`、`Agent.imagine/train_batch`。
+- [config.py](../spikedreamer/config.py)：命名 preset 与非法组合检查。
+- [acceleration.py](../spikedreamer/acceleration.py)：区域 fullgraph 编译，参数键保持不变。
+
+当前模型没有 Transformer attention、KV cache 或 MoE；这些机制不是本研究的组成部分。[研究计划](research-roadmap.md) 列出下一步应补齐的证据。

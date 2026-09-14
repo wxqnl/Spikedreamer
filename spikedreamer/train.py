@@ -35,6 +35,8 @@ def run(c, directory):
         rng = np.random.default_rng(c.seed + 17)
         if c.resume:
             saved = torch.load(directory / "latest.pt", map_location="cpu", weights_only=False)
+            if saved.get("format_version") != 2:
+                raise ValueError("Pre-correction checkpoints must not resume under the corrected trainer")
             mutable = {"frames", "eval_every", "eval_episodes", "log_every",
                        "max_updates", "resume", "device", "compile", "cpu_threads"}
             differences = [k for k in saved["config"]
@@ -63,7 +65,7 @@ def run(c, directory):
 
         def save(status):
             atomic_save(dict(
-                format_version=1, config=vars(c), actions=agent.actions,
+                format_version=2, config=vars(c), actions=agent.actions,
                 agent=agent.training_state(), replay=replay.state_dict(),
                 frames=frames, decisions=decisions, update_credit=update_credit,
                 completed_episodes=completed, environment_rng=rng.bit_generator.state,
@@ -72,7 +74,7 @@ def run(c, directory):
 
         def update():
             nonlocal latest_metrics
-            batch = replay.sample(c.batch_size, c.burn_in + c.batch_length)
+            batch = replay.sample(c.batch_size, c.batch_length, burn_in=c.burn_in)
             latest_metrics = agent.train_batch(batch)
 
         logger.write(frames, event="started", method=c.method,
@@ -96,10 +98,20 @@ def run(c, directory):
                 action_tensor, state = agent.act(stack_obs(obs), state, previous)
                 previous = action_tensor
                 actions = action_tensor.cpu().numpy()
+            # Only dispatch a full group when its maximum frame increment fits.
+            # Consume transitions, resets, replay writes and update credit in
+            # exactly the previous environment order.
+            steps = None
+            if (frames + len(envs) * c.action_repeat <= c.frames
+                    and all(hasattr(env, "step_async") for env in envs)):
+                for env, action in zip(envs, actions):
+                    env.step_async(action)
+                steps = [env.step_wait() for env in envs]
             for i, env in enumerate(envs):
                 if frames >= c.frames:
                     break
-                observation, reward, done, count = env.step(actions[i])
+                observation, reward, done, count = (
+                    steps[i] if steps is not None else env.step(actions[i]))
                 replay.add(i, observation, actions[i], reward, done)
                 frames += count
                 decisions += 1

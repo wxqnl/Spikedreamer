@@ -1,6 +1,7 @@
 """Configuration shared by every paired experiment."""
 
 import argparse
+import math
 from copy import deepcopy
 from types import SimpleNamespace
 from ruamel.yaml import YAML
@@ -15,28 +16,44 @@ DEFAULTS = dict(
     hidden=512, deter=512, stoch=32, classes=32, cnn_depth=32,
     io_steps=1, core_steps=8, input_layers=1, output_layers=1,
     persistent=True, reset_dendrites=True, readout="spike",
+    dendrite_half_life_init=8.0,
     adaptive_max_steps=1, entropy_threshold=0.8, spike_reg=0.0,
     threshold=0.5, tau=2.0, tau_basal=2.0, tau_apical=2.0, core_norm_gain=2.0,
     dyn_scale=0.5, rep_scale=0.1, kl_free=1.0, unimix=0.01,
     model_lr=1e-4, actor_lr=3e-5, value_lr=3e-5, opt_eps=1e-8,
-    grad_clip=1000.0, imag_horizon=15, discount=0.997,
+    grad_clip=1000.0, ac_opt_eps=1e-5, actor_grad_clip=100.0, value_grad_clip=100.0,
+    imag_horizon=15, discount=0.997,
     lambda_=0.95, actor_entropy=3e-4, slow_fraction=0.02,
-    precision="fp32", cpu_threads=4,
+    precision="fp32", cpu_threads=4, compile=False,
     max_updates=0, save_replay=True, resume=False,
 )
 
 PRESETS = {
     "legacy": dict(method="legacy", io_steps=8, core_steps=8),
+    "stateful_t8": dict(method="stateful", io_steps=8, core_steps=8,
+                        adaptive_max_steps=1, core_norm_gain=1.0, persistent=True),
+    "stateful_context32": dict(method="stateful", io_steps=8, core_steps=8,
+                               adaptive_max_steps=1, core_norm_gain=1.0,
+                               persistent=True, burn_in=32),
+    "stateful_slowmem32": dict(method="stateful_slowmem", io_steps=8, core_steps=8,
+                               adaptive_max_steps=1, core_norm_gain=1.0,
+                               persistent=True, reset_dendrites=False, burn_in=32),
+    "stateful_gatedmem32": dict(method="stateful_gatedmem", io_steps=8, core_steps=8,
+                                adaptive_max_steps=1, core_norm_gain=1.0,
+                                persistent=True, reset_dendrites=False, burn_in=32),
     "ta": dict(method="ta", io_steps=1, adaptive_max_steps=1),
     "ta_core": dict(method="ta", io_steps=8, adaptive_max_steps=1),
     "adaptive": dict(method="ta", io_steps=1, adaptive_max_steps=4),
     "binary": dict(method="binary", io_steps=1, persistent=False),
     "gru": dict(method="gru", io_steps=1),
+    "ann_gru": dict(method="ann_gru", io_steps=1, core_steps=1),
+    "lif_t8": dict(method="lif", io_steps=8, core_steps=8, deter=624,
+                   adaptive_max_steps=1, core_norm_gain=1.0, persistent=True),
 }
 
 
 def validate(c):
-    if c.method not in ("legacy", "ta", "binary", "gru"):
+    if c.method not in ("legacy", "stateful", "stateful_slowmem", "stateful_gatedmem", "ta", "binary", "gru", "ann_gru", "lif"):
         raise ValueError(f"Unsupported method: {c.method}")
     for name in ("frames", "action_repeat", "envs", "time_limit", "eval_every",
                  "log_every", "batch_size", "batch_length", "hidden", "deter",
@@ -58,14 +75,32 @@ def validate(c):
         raise ValueError("readout must be spike or membrane")
     if c.method == "legacy" and c.io_steps != c.core_steps:
         raise ValueError("Legacy core_steps and io_steps must match")
+    if c.method == "ann_gru" and (c.io_steps != 1 or c.core_steps != 1):
+        raise ValueError("Full ANN GRU uses one recurrent update, not spike time")
+    if c.method in ("stateful", "lif"):
+        if c.io_steps != c.core_steps:
+            raise ValueError("Fixed-step stateful core_steps and io_steps must match")
+        if c.core_norm_gain != 1.0 or c.readout != "spike" or not c.reset_dendrites:
+            raise ValueError("Fixed-step stateful uses released gain=1, spike readout and dendrite reset")
+    if c.method in ("stateful_slowmem", "stateful_gatedmem"):
+        if c.io_steps != c.core_steps or c.core_norm_gain != 1.0 or c.readout != "spike":
+            raise ValueError("Slow-memory MCN requires fixed matching T, gain=1 and spike readout")
+        if c.reset_dendrites or not c.persistent:
+            raise ValueError("Slow dendrites must persist without spike-triggered reset")
+        if not math.isfinite(c.dendrite_half_life_init) or c.dendrite_half_life_init <= 0:
+            raise ValueError("Initial dendrite half-life must be finite and positive")
     if c.adaptive_max_steps > 1 and c.method != "ta":
         raise ValueError("Adaptive refinement requires the MCN core")
     if not 0 <= c.entropy_threshold <= 1:
         raise ValueError("entropy_threshold must be in [0, 1]")
     if min(c.tau, c.tau_basal, c.tau_apical) < 1:
         raise ValueError("Neuron time constants must be >= 1")
-    if c.core_norm_gain <= 0 or c.grad_clip <= 0:
-        raise ValueError("core_norm_gain and grad_clip must be positive")
+    for name in ("core_norm_gain", "model_lr", "actor_lr", "value_lr",
+                 "opt_eps", "ac_opt_eps", "grad_clip", "actor_grad_clip", "value_grad_clip"):
+        if getattr(c, name) <= 0:
+            raise ValueError(f"{name} must be positive")
+    if c.imag_horizon < 2:
+        raise ValueError("The released behavior target needs imag_horizon >= 2")
     if min(c.eval_episodes, c.pretrain, c.max_updates) < 0:
         raise ValueError("eval_episodes, pretrain and max_updates cannot be negative")
     if c.resume and not c.save_replay:

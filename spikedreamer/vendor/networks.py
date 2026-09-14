@@ -220,7 +220,7 @@ class RSSM(nn.Module):
             )
         return dist
 
-    def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+    def obs_step(self, prev_state, prev_action, embed, is_first, sample=True, reset=None):
         # if shared is True, prior and post both use same networks(inp_layers, _img_out_layers, _ims_stat_layer)
         # otherwise, post use different network(_obs_out_layers) with prior[deter] and embed as inputs
         self.reset()
@@ -229,7 +229,9 @@ class RSSM(nn.Module):
         # print("#"*100)
         # print("prev_state deter:  ", prev_state["deter"].shape)
         # 初始化 is_firest 对应 idx的 state, 更新prev_state内容
-        if torch.sum(is_first) > 0:
+        if reset is None:
+            reset = bool(torch.sum(is_first) > 0)
+        if reset:
             is_first = is_first[:, None]
             prev_action *= 1.0 - is_first
             init_state = self.initial(len(is_first))
@@ -627,7 +629,7 @@ class SpikeConvEncoder(nn.Module):
             # x = x.permute(0, 3, 1, 2)
             x = self.layers(inp)
             # (batch * time, ...) -> (batch * time, -1)
-            x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
+            x = x.flatten(1)
             # (batch * time, -1) -> (batch, time, -1)
             outs.append(x.reshape(list(obs.shape[:-3]) + [x.shape[-1]]))
         return outs
@@ -803,7 +805,7 @@ class SpikeMLP(nn.Module):
                 self.std_layer = nn.Linear(units, np.prod(self._shape))
                 self.std_layer.apply(tools.uniform_weight_init(outscale))
 
-    def forward(self, features, dtype=None, unroll=False, pr=False):
+    def _spike_features(self, features, dtype=None, unroll=False, pr=False):
         self.reset()
         if unroll:
             shape = [self.T] + [1] * len(features.shape)
@@ -817,6 +819,10 @@ class SpikeMLP(nn.Module):
             outs.append(self.layers(features[step]))
         outs =  sum(outs) / self.T
         
+        return outs
+
+    def forward(self, features, dtype=None, unroll=False, pr=False):
+        outs = self._spike_features(features, dtype, unroll, pr)
         if self._shape is None:
             return outs
         if isinstance(self._shape, dict):
@@ -925,14 +931,17 @@ class ActionHead(nn.Module):
             self._dist_layer = nn.Linear(self._units, self._size)
             self._dist_layer.apply(tools.uniform_weight_init(outscale))
 
-    def forward(self, features, dtype=None):
+    def _spike_features(self, features, dtype=None):
         # x = features
         self.reset()
         xs = []
         for step in range(self.T):
             s = self._pre_layers(features[step])
             xs.append(s)
-        x = sum(xs) / self.T
+        return sum(xs) / self.T
+
+    def forward(self, features, dtype=None):
+        x = self._spike_features(features, dtype)
         if self._dist == "tanh_normal":
             x = self._dist_layer(x)
             mean, std = torch.split(x, [self._size] * 2, -1)

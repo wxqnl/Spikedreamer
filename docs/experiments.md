@@ -1,79 +1,99 @@
-# 实验协议与运行预算
+# 实验协议与结果来源
 
-## 固定协议
+本文记录 2026-09-14 已完成的 Walker seed 0 研究，不把未来实验矩阵写成既有结果。[README](../README.md) 展示主表；[结果 JSON](../results/walker_seed0.json) 保存全部评估值。
 
-主表：DMC 19 visual-control 任务，RGB 64×64，1M 原始环境 frames，action repeat=2，seeds 0/1/2，每次评估使用固定 held-out 初始条件的 10 个完整 episodes。任务列表定义于 `spikedreamer/env.py`。
+## 已完成范围
 
-所有配对方法固定 B=16、L=64、hidden/deter=512、32×32 categorical latent、H=15、train_ratio=512、4 个环境。4 个模拟器在同一进程中轮流 step，不声称四个并行 CPU worker。正式结果 `max_updates=0`，默认 FP32。
+五组为 `legacy`、`stateful_t8`、`ann_gru`、`lif_t8` 和 `stateful_gatedmem32`。每组均完成 1M 原始环境帧、71,171 次训练更新和 100 个完整评估点。完整任务范围目前只有 `walker_walk`，训练种子只有 0。
 
-帧数包含随机 prefill；`prefill=2500` 的单位是 agent transitions，`train_ratio` 是每个新增 transition 消费的训练时间步数量。每个梯度更新消费 B×L=1024 个时间步，通常每两个 agent transitions 更新一次；burn-in 不计入受监督 L。
+框架支持 19 个视觉 DMC 任务，不等于已完成 19 任务基准。早期 TA/自适应短验证、提前停止的 context32/slowmem 和固定 T8 主表分开报告。
 
-## 先筛选，再扩展
+## 交互、训练与评估
 
-| 阶段 | 任务及预算 | 退出条件 |
+| 项目 | 本次配置 |
+|---|---|
+| 环境 | 真实 DeepMind Control Suite，Walker Walk |
+| 输入 | 64×64 RGB |
+| 交互预算 | 1,000,000 原始环境帧，包含随机 prefill |
+| action repeat / episode 上限 | 2 / 1000 原始帧 |
+| 采样环境 | 4 个真实模拟器；当前路径为独立 CPU OSMesa 工作进程 |
+| prefill / pretrain | 2500 agent transitions / 100 次更新 |
+| batch / 学习长度 | B=56，L=64；每次更新消费 3584 个学习时间步 |
+| train ratio | 每个新增 transition 对应 512 个学习时间步 |
+| 想象长度 / 随机潜变量 | H=15 / 32×32 categorical |
+| 精度 / 上限 | FP32，`max_updates=0`，不做更新数截断 |
+| 评估频率 | 10K、20K、…、1M 帧，每个位置评估 10 个完整回合 |
+| 评估随机性 | 固定 seeds 100000–100009，动作取 mode，posterior 仍采样 |
+| 训练恢复 | 格式 2 检查点；恢复模型、三个 Adam、回放和 RNG，模拟器开启新 episode |
+
+环境返回的实际 frame count 用于记账，评估交互不加入 1M 训练帧。每个非 prefill transition 累积 `512 / (56×64) = 1/7` 次更新额度；Walker 完整预算对应：
+
+```text
+100 + floor((1,000,000 / 2 - 2500) / 7) = 71,171 updates
+```
+
+五组的每个固定评估帧点具有相同更新数。Gated Memory 另取最多 32 步真实前缀做无梯度 burn-in；它增加计算，但不缩短 L64，也不计入上述学习样本预算。其他四组已完成运行的 burn-in 为 0。
+
+评估时按回合保留独立 RNG，恢复训练 RNG 后再继续学习。CPU 渲染可以重叠执行，网络仍按独立 B1 轨迹推理；不能将并行环境数当作独立训练种子。
+
+## 模型差异
+
+| preset | 外围 / 核心 | deter | burn-in | 总参数 | 可训练参数 |
+|---|---|---:|---:|---:|---:|
+| `stateful_gatedmem32` | SNN T8 / MCN T8，输入依赖树突记忆 | 512 | 32 | 19,896,503 | 18,715,060 |
+| `ann_gru` | ANN / ANN-GRU，单次递归更新 | 512 | 0 | 19,107,469 | 17,926,030 |
+| `stateful_t8` | SNN T8 / 显式状态 MCN T8 | 512 | 0 | 18,846,903 | 17,665,460 |
+| `lif_t8` | SNN T8 / 单房室 LIF T8 | 624 | 0 | 19,102,583 | 17,863,796 |
+| `legacy` | 发布版 SNN T8 / MCN T8 + 共享训练器 | 512 | 0 | 18,846,903 | 17,665,460 |
+
+总参数包括冻结的 slow-value 网络。LIF 的 deter=624 是实际已完成配置，不能在整理时改写成 512；ANN 使用完整 ANN 外围，不能标成只替换 RSSM 核心。
+
+Gated Memory 相对 Stateful-T8 同时改变树突复位、保留更新、输入门控和 burn-in，并增加 1,049,600 个参数。相对 Static Slow Memory，新增门投影替代 1024 个静态保留参数，净增 1,048,576 个参数。当前结果不是参数或计算量严格配平的机制消融。
+
+## 结果统计
+
+主终点为恰好 1M 帧的评估均值，不选择训练过程最高点。辅助指标取 910K–1M 的末十个评估位置的均值。每点评估标准差使用 `ddof=0`，反映同一已训练策略的十个回合差异。
+
+末十次评估来自同一训练轨迹，彼此相关；100 个评估点也不能充当 100 个独立种子。当前不报告显著性检验、跨种子置信区间或非劣性结论。旧统计工具的多任务、配对种子前提仍须满足，不能把这一份 seed 0 数据输入后放宽门槛。
+
+完整曲线及逐回合分数保存在 [walker_seed0.json](../results/walker_seed0.json)，数值表和图由 [report.py](../spikedreamer/report.py) 生成。图中不平滑、不补点，阴影为回合标准差而非跨训练种子的置信区间。
+
+## 运行时长与故障记录
+
+| 方法 | 累计进程时长 / h | 首次启动至完成 / h | 解释 |
+|---|---:|---:|---|
+| Gated Memory-T8 | 35.61 | 35.61 | 单段完成，无训练失败或重启 |
+| ANN-GRU | 11.21 | 11.21 | 单段完成 |
+| Stateful-T8 | 32.00 | 33.42 | 经过两次人工恢复及吞吐路径更新 |
+| LIF-T8 | 27.76 | 27.76 | 单段完成 |
+| Legacy-T8 | 32.43 | 34.15 | 两次人工恢复；另有一次恢复配置检查失败 |
+
+累计进程时长包含编译、采样、训练、评估、I/O 和恢复前未保留的尾段。首尾时长还包含暂停间隔。Legacy 的失败是恢复配置检查，不应隐去，也不能据此捏造数值发散。原始日志保留在各自档案中。
+
+这些数值是完成实验的观测时长，不是纯 GPU-hours 或统一硬件负载下的 microbenchmark。Gated Memory 在本次记录中慢于 ANN，没有训练加速结论。旧 TA 的短 checkpoint 测量见 [历史验证](validation-20260908.md)，不能用于当前 Gated Memory 的速度或能耗主张。
+
+## 运行环境
+
+完整实验使用 Python 3.10.16、PyTorch 2.6.0 / CUDA 12.4、H100 80GB、dm-control 1.0.9、MuJoCo 2.3.5 和 NumPy 1.26.4。每组实际包版本及配置均在结果 JSON 的 `runtime` 与 `config` 中保留。
+
+当前训练入口从 CPU 子进程运行真实 MuJoCo 物理和 OSMesa 渲染，使用 `runtime/with-osmesa.sh` 设置渲染变量。系统必须已提供 OSMesa 动态库。已完成运行还通过 `SPIKEDREAMER_ENV_LD_PRELOAD` 仅为子进程指定可用的 `libstdc++.so.6`；不能把这项预加载移到 CUDA 训练父进程。
+
+2026-09-14 整理时，主代码服务器缺少系统 OSMesa，真实环境测试在那里未通过；同份代码在原训练服务器的 CPU 上通过 Walker 真实环境检查。没有为文档整理安装驱动或改动系统渲染库，详见 [验证记录](validation.md)。
+
+命令见 [README](../README.md#训练与评估)。`configs/dmc_1m.yaml` 固定共用预算，preset 决定模型宽度、T 和 burn-in。老默认 B16/TA 只为历史兼容保留；遗漏 `--preset` 或共用配置就不是本次主协议。
+
+## 原始证据与导出
+
+以下路径均相对原始实验档案根目录；仓库只收录可公开的数值证据，不收录检查点、回放、内部监控状态或凭证。
+
+| 档案目录 | 主记录 | 对应结果 |
 |---|---|---|
-| 实现检查 | Cartpole / Walker，完整尺寸、少量更新 | 有限 loss/梯度、恢复正确、真实评估完成 |
-| 方向筛选 | Cartpole Balance、Walker Walk、Cheetah Run；200K frames；1 seed | 没有明显学习崩溃，再增加 seeds |
-| 机制开发 | DEV6；500K frames；3 seeds | 固定单步接近 T=8，同时优于 T=1/reset 对照 |
-| 主结果 | 19 任务；1M frames；3 seeds | 满足预先约定的性能与计算门槛 |
-| 消融 | DEV6；1M frames；3 seeds | 区分 T、持久膜电位、读出与归一化尺度的贡献 |
+| `spikedreamer-fixed-t8-walker-20260910/` | `FINAL_RESULTS.json` | Legacy-T8、Stateful-T8 |
+| `spikedreamer-walker-gru-lif-20260911/` | `FINAL_RESULTS.json` | ANN-GRU、LIF-T8 |
+| `spikedreamer-stateful-gatedmem-walker-20260912/` | `FINAL_RESULTS.json` | Gated Memory-T8 |
+| `spikedreamer-stateful-context32-walker-20260912-rerun1/` | `STOPPED_BY_USER.json` | 71K 日志 / 70K 检查点，提前停止 |
+| `spikedreamer-stateful-slowmem-walker-20260912/` | `STOPPED_BY_USER.json` | 98K 日志 / 90K 检查点，提前停止 |
 
-DEV6 为 Cartpole Balance、Cartpole Swingup Sparse、Cup Catch、Finger Spin、Walker Walk、Cheetah Run。自适应分支只有在固定单步表现不足且开发集验证有效后才扩展；当前不建议作为默认大规模训练配置。
+每组原始评估来自 `runs/<preset>/walker_walk/seed-0/metrics.jsonl`。恢复后以检查点保留前缀和后续实际评估组成曲线，不把被丢弃尾段当成额外样本。导出器检查完整帧点、更新数、逐回合统计和终点档案一致性；它不替代模型或回放验收。
 
-不要用本文仓库的短验证回报选择最终算法，也不要把其中单 episode 当作 seed 统计。
-
-## 运行方法
-
-```bash
-python -m spikedreamer.suite --root runs/screen --tasks cartpole_balance walker_walk cheetah_run \
-  --presets legacy ta --seeds 0 --gpus 0 1 2 3 4 5 --frames 200000
-```
-
-重复运行需添加 `--resume`；调度器拒绝覆盖已有实验，跳过已有相同预算的 completed run，失败时停止本次调度器启动的其他子进程。日志在 `_workers/`，训练文件在 `preset/task/seed-N/`。`update_limit` 表示人为限制更新次数，不是预算完成。
-
-关键单项消融应使用独立目录：
-
-```bash
-python -m spikedreamer.train --preset legacy --logdir runs/legacy-t1/walker/seed-0 \
-  --set task=walker_walk io_steps=1 core_steps=1
-python -m spikedreamer.train --preset ta --logdir runs/reset/walker/seed-0 \
-  --set task=walker_walk persistent=False
-python -m spikedreamer.train --preset ta --logdir runs/gain1/walker/seed-0 \
-  --set task=walker_walk core_norm_gain=1
-```
-
-另跑 `ta_core`、`binary`、`gru`、`readout=membrane`。外围 T 的变化会影响 encoder/decoder/actor/critic 成本，不能把整体加速完全称为 RSSM 机制收益。官方原训练入口另保存在 `upstream/`；主对照 `legacy` 使用相同的新训练器，论文中应准确命名。
-
-## 性能统计
-
-主指标是任务均值等权聚合后的 candidate / baseline 比值。使用 task、训练 seed 两层配对 bootstrap 的 95% 区间；下界 ≥0.95 才满足预设 5% 相对非劣门槛。19 任务中退化超过 10% 的任务至多 2 个，作为额外 guardrail。
-
-5% 相对 margin 不等于固定 -50 分；评估 episodes 不能当作独立训练 seeds。统计脚本要求至少每任务 3 个配对 seeds、相同任务集合与交互/训练协议，且必须存在指定帧数的实际评估。
-
-```bash
-python -m spikedreamer.aggregate \
-  --baseline runs/main/legacy/*/seed-* --candidate runs/main/ta/*/seed-* \
-  --frames 1000000 --output runs/main/comparison.json
-```
-
-保留完整学习曲线、任务级得分与多 seed 方差；开环诊断只评估 replay 内真实序列，默认 5 步上下文及 1/5/15/50 步预测，自动排除跨 episode 的预测。它不是 held-out 泛化或控制成功的替代指标。
-
-## 计算与能耗
-
-在同一张空闲 GPU 上顺序测量同尺寸、同精度的 checkpoint。先 warm-up，再独立测量 RSSM 一步、H=15 imagination、真实输入的 B=1 policy、完整训练更新；必要时使用 `--parts world_update behavior_update` 拆分。延迟测量期间不注册计数 hooks。重复时间窗并报告 p50/p95，不把单次开发测量当作论文置信区间。
-
-三类数字分别报告：
-
-1. Dense MAC：Linear/Conv/ConvTranspose/GRU 投影的实际形状账本，不按发放率打折；不含反向、优化器、归一化等全部 FLOPs。
-2. H100 测量：CUDA/wall 时间、峰值显存、NVML 设备能耗。原始 J 包含 idle draw，且不含整机 CPU/内存；`--idle-watts` 只接受同设备另测的 idle 值。训练 microbenchmark 的优化器只修改内存副本，不保存回 checkpoint。
-3. 神经形态代理：二值输入 Linear 的活动连接数，Conv 使用平均活动率近似；不是 dense GPU 的实际跳零运算。`--mac-pj`、`--ac-pj`、`--neuron-pj` 和 `--coefficient-source` 可生成指定系数的算术能耗估算，系数必须一起提供并解释来源。该估算不含访存和未计数算子，不能写成实测器件总能耗。
-
-主研究目标：性能非劣，imagination 的 GPU 延迟或设备能耗至少下降 20%，参数增幅不超过 5%。更强目标是 energy-to-score、整段训练时间也改善；这些需要完整训练记录，短 profile 不能证明。
-
-## 基于当前实测的预算
-
-同卡 FP32 开发测量：完整更新约 TA 0.49 秒、legacy 2.03 秒。1M frames 的主协议约有 248,850 次更新，仅更新计算就约 **TA 34 GPU-hours、legacy 141 GPU-hours / task / seed**，还需加采样、评估和 checkpoint 时间。
-
-这是短 checkpoint 的线性外推，不是完成训练的实测时长。显存不是主要问题，更新次数和多任务多 seed 才是。19×3×两个方法的正式矩阵约一万 GPU-hours 量级，不应依据“小模型”就直接全量启动。当前交付只进行了有明确更新上限的实现验证，没有启动该矩阵。
-
-正式跑分前先测 10K–20K frames 的稳定吞吐；如需降低 `train_ratio`，应对所有方法统一调整、单列协议，不与原 512 协议混报。
+当前统一代码来自已完成 Gated Memory 的冻结实现，保留五组模型结构。旧曲线属于各自冻结代码和运行记录，不声称统一入口能逐位复现经过恢复与吞吐迭代的历史轨迹。未来研究计划见 [research-roadmap.md](research-roadmap.md)，本次整理没有启动新实验。

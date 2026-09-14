@@ -17,6 +17,12 @@ DEV6 = ["cartpole_balance", "cartpole_swingup_sparse", "cup_catch",
 
 
 class DMC:
+    def __new__(cls, c, seed):
+        if os.environ.get("SPIKEDREAMER_ENV_PROCESS") == "1":
+            from .env_process import ProcessDMC
+            return ProcessDMC(c, seed)
+        return super().__new__(cls)
+
     def __init__(self, c, seed):
         from dm_control import suite
         task = c.task.removeprefix("dmc_")

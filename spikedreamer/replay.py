@@ -51,7 +51,15 @@ class Replay:
     def size(self):
         return sum(len(e["reward"]) - 1 for e in self.episodes.values())
 
-    def sample(self, batch, length):
+    def sample(self, batch, length, burn_in=0):
+        """Sample an unchanged learning window, optionally preceded by its history.
+
+        Prefix construction consumes no replay RNG. Left padding repeats a real
+        observation only for fixed tensor shapes; warmup_valid excludes it from
+        state updates, and the entire prefix is excluded from training targets.
+        """
+        if batch < 1 or length < 1 or burn_in < 0:
+            raise ValueError("Invalid replay batch, learning length or burn-in")
         candidates = list(self.episodes.values()) + [
             e for e in self.active.values() if len(e["reward"]) > 1]
         if not candidates:
@@ -60,17 +68,37 @@ class Replay:
         probabilities = (sizes - 1) / (sizes - 1).sum()
         rows = []
         for _ in range(batch):
-            pieces, remaining = [], length
+            pieces, remaining, prefix = [], length, None
             while remaining:
                 episode = candidates[self.rng.choice(len(candidates), p=probabilities)]
                 index = int(self.rng.integers(len(episode["reward"]) - 1)) if not pieces else 0
                 take = min(remaining, len(episode["reward"]) - index)
+                if burn_in and not pieces:
+                    count = min(burn_in, index)
+                    prefix = {}
+                    for key, values in episode.items():
+                        first = np.array(values[:1], copy=True)
+                        # Active trajectories use lists. An empty list loses both
+                        # observation shape and dtype; slice a shaped array instead.
+                        history = (np.array(values[index - count:index], copy=True)
+                                   if count else first[:0])
+                        prefix[key] = np.concatenate((
+                            np.repeat(first, burn_in - count, axis=0), history), axis=0)
+                    if count:
+                        # A truncated prefix still needs a defined initial state.
+                        prefix["is_first"][burn_in - count] = True
+                    valid = np.arange(burn_in) >= burn_in - count
                 # Copy before setting sequence-boundary flags: replay is immutable.
                 part = {k: np.array(v[index:index + take], copy=True) for k, v in episode.items()}
-                part["is_first"][0] = True
+                if not burn_in or pieces or index == 0:
+                    part["is_first"][0] = True
                 pieces.append(part)
                 remaining -= take
-            rows.append({k: np.concatenate([p[k] for p in pieces]) for k in pieces[0]})
+            row = {k: np.concatenate([p[k] for p in pieces]) for k in pieces[0]}
+            if prefix is not None:
+                row = {k: np.concatenate((prefix[k], row[k])) for k in row}
+                row["warmup_valid"] = valid
+            rows.append(row)
         return {k: np.stack([row[k] for row in rows]) for k in rows[0]}
 
     def state_dict(self):

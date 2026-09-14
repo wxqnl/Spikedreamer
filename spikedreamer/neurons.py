@@ -11,7 +11,9 @@ class LIFStack(nn.Module):
     def __init__(self, inputs, hidden, layers, c):
         super().__init__()
         self.hidden, self.depth = hidden, layers
-        self.tau, self.threshold = c.tau, c.threshold
+        self.tau = c.tau
+        # Match the released trainer: one learnable firing threshold per LIF layer.
+        self.threshold = nn.Parameter(torch.full((layers,), float(c.threshold)))
         self.projections = nn.ModuleList(
             nn.Linear(inputs if i == 0 else hidden, hidden, bias=False)
             for i in range(layers))
@@ -28,7 +30,7 @@ class LIFStack(nn.Module):
         membranes = []
         for i, (linear, norm) in enumerate(zip(self.projections, self.norms)):
             voltage = state[:, i] + (norm(linear(x)) - state[:, i]) / self.tau
-            x = self.fire(voltage - self.threshold)
+            x = self.fire(voltage - self.threshold[i])
             membranes.append(voltage * (1 - x.detach()))
         return x, torch.stack(membranes, 1)
 
@@ -44,7 +46,7 @@ class MCNCell(nn.Module):
             PopNorm(size, threshold=c.threshold * c.core_norm_gain, v_reset=0.0, eps=1e-3)
             for _ in range(3))
         self.tau, self.tau_b, self.tau_a = c.tau, c.tau_basal, c.tau_apical
-        self.threshold = c.threshold
+        self.threshold = nn.Parameter(torch.tensor(float(c.threshold)))
         self.reset_dendrites = c.reset_dendrites
         self.memoryless = c.method == "binary"
         self.fire = QGateGrad(alpha=c.tau, requires_grad=False)

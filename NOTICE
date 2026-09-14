@@ -15,3 +15,14 @@ Please cite the original work when using the inherited Spiking-WM architecture:
 Sun et al. (2025), Spiking world model with multicompartment neurons for
 model-based reinforcement learning, PNAS 122(50), e2513319122.
 DOI: 10.1073/pnas.2513319122.
+
+ANN components in spikedreamer/vendor/ann_networks.py derive from
+NM512/dreamerv3-torch, Copyright (c) 2023 NM512:
+https://github.com/NM512/dreamerv3-torch
+They retain the MIT License included at upstream/ann-dreamer/LICENSE.
+The upstream/ann-dreamer/ directory is a separate ANN source snapshot,
+not part of the original Spiking-WM snapshot described above.
+
+The gated-memory motivation also cites Qin et al. (2025), AAAI 39(2),
+1483-1491, DOI: 10.1609/aaai.v39i2.32139. This project does not claim
+to reproduce GRSN. See docs/upstream.md and docs/references.bib.

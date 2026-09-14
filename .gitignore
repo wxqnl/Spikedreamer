@@ -11,3 +11,15 @@ runs/
 events.out.tfevents.*
 .env
 .DS_Store
+
+# Generated caches, packaging and local credentials
+.cache/
+build/
+dist/
+*.orig
+*.rej
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json

@@ -19,7 +19,7 @@ def checkpoint_batch(checkpoint, c, saved):
         with np.load(replay.directory / f"{name}.npz", allow_pickle=False) as ep:
             replay.episodes[name] = {k: ep[k] for k in ep.files}
     replay.active = saved["replay"]["active"]
-    return replay.sample(c.batch_size, c.burn_in + c.batch_length)
+    return replay.sample(c.batch_size, c.batch_length, burn_in=c.burn_in)
 
 
 def main():
